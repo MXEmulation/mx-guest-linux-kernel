@@ -10,7 +10,7 @@ This commit contains licence texts, contribution guidance and DCO and REUSE work
 ## Dependencies
 
 [Core](https://github.com/MXEmulation/mx-guest-core) and [Linux Common](https://github.com/MXEmulation/mx-guest-linux-common) are declared in `.gitmodules` at `deps/core` and `deps/linux-common`.
-This commit has no submodule gitlinks.
+Both submodules are pinned by gitlinks to exact commits.
 
 ## Licence
 
