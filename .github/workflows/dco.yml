@@ -1,0 +1,30 @@
+name: DCO
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  signoff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Require a Signed-off-by trailer matching the author on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          commits="$(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA")"
+          status=0
+          for c in $commits; do
+            author="$(git log -1 --format='%an <%ae>' "$c")"
+            if ! git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$c" | grep -qxF "$author"; then
+              echo "::error::commit $c lacks 'Signed-off-by: $author'"
+              status=1
+            fi
+          done
+          exit $status

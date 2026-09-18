@@ -1,0 +1,6 @@
+[submodule "deps/core"]
+	path = deps/core
+	url = https://github.com/MXEmulation/mx-guest-core.git
+[submodule "deps/linux-common"]
+	path = deps/linux-common
+	url = https://github.com/MXEmulation/mx-guest-linux-common.git

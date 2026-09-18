@@ -1,0 +1,23 @@
+# Build output
+/build/
+*.o
+*.a
+*.so
+*.d
+
+# Kernel module build output
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+.*.d
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

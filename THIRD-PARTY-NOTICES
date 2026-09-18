@@ -1,0 +1,83 @@
+THIRD-PARTY NOTICES: mx-guest-linux-kernel
+
+This file lists third-party work carried in this repository or shipped
+from it, with the SPDX licence identifier, the copyright holders and the
+source location of each.
+
+
+THIRD-PARTY WORK CARRIED IN THIS REPOSITORY
+
+None. At present this repository carries no third-party work. Every file
+in it other than the licence texts (LICENCE and LICENSES/) is MX's
+own work, licensed under GPL-2.0-only
+(SPDX identifier GPL-2.0-only), copyright 2026 Zak Noble-Clarke,
+as stated in each file's SPDX header or in REUSE.toml.
+
+
+MX DEPENDENCIES
+
+These are MX's own repositories, not third-party work. They will be
+carried as git submodules pinned to exact commits, and their files are
+compiled into the kernel modules.
+
+  mx-guest-core
+    Path:      deps/core
+    Licence:   MIT (SPDX identifier MIT)
+    Copyright: 2026 Zak Noble-Clarke
+    Source:    https://github.com/MXEmulation/mx-guest-core
+
+  mx-guest-linux-common
+    Path:      deps/linux-common
+    Licence:   MIT (SPDX identifier MIT)
+    Copyright: 2026 Zak Noble-Clarke
+    Source:    https://github.com/MXEmulation/mx-guest-linux-common
+
+The MIT files keep their own SPDX headers. The modules they are compiled
+into are distributed under GPL-2.0-only; README.md explains that
+arrangement and the point in it that is pending review.
+
+
+BUILD INPUTS, NOT REDISTRIBUTED
+
+  Linux kernel headers, the kernel build system, and the DRM helpers
+  exported by the kernel (including those exported with
+  EXPORT_SYMBOL_GPL)
+    Licence:   GPL-2.0-only (the kernel as a whole, per its COPYING
+               file). The Linux-syscall-note exception applies to the
+               kernel's uapi headers only, and not to these modules.
+               Individual kernel files carry their own SPDX identifiers.
+    Copyright: the Linux kernel's many copyright holders, as recorded in
+               the kernel source
+    Source:    https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+
+  The modules are compiled against the headers and build system of the
+  kernel they will run on: the guest's own installed kernel headers when
+  built through DKMS, and each distribution's own kernel headers in CI.
+  No copy of any kernel file is placed in this repository or shipped from
+  it, so no notice obligation arises from those files.
+
+  The obligation that does arise is on the modules themselves. They must
+  declare a GPL-compatible licence to resolve symbols exported with
+  EXPORT_SYMBOL_GPL, they are distributed under GPL-2.0-only, and
+  distributing them under GPL-2.0-only requires distributing their
+  complete corresponding source, including the build and install scripts.
+  README.md lists what that includes.
+
+  The Linux-syscall-note exception (SPDX: Linux-syscall-note), which the
+  kernel applies to its uapi headers, says that user programs using
+  kernel services by normal system calls are not derived works of the
+  kernel. It covers userspace programs that use the kernel's uapi. It
+  does not cover kernel modules, and nothing in this repository relies on
+  it.
+
+
+WHEN AN ENTRY MUST BE ADDED
+
+A build-time dependency creates no notice obligation. A shipped copy
+creates one immediately. As soon as any third-party file, fragment,
+vendored library or generated artefact derived from third-party work is
+placed in this repository, or shipped from it, it must be listed under
+"Third-party work carried in this repository" in the same commit, with
+its original notices kept intact. That includes any kernel header or
+helper copied into this repository instead of being used from the
+target kernel's headers.

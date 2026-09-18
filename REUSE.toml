@@ -1,0 +1,13 @@
+version = 1
+SPDX-PackageName = "mx-guest-linux-kernel"
+SPDX-PackageSupplier = "Zak Noble-Clarke <support@coretools.app>"
+SPDX-PackageDownloadLocation = "https://github.com/MXEmulation/mx-guest-linux-kernel"
+
+# Documentation and repository metadata that cannot carry a comment header,
+# or where a header would be noise. Every source file carries its own
+# SPDX-License-Identifier and SPDX-FileCopyrightText header instead.
+[[annotations]]
+path = ["README.md", "THIRD-PARTY-NOTICES", "REUSE.toml", ".gitignore", ".gitmodules", ".github/**", "CONTRIBUTING.md"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Zak Noble-Clarke"
+SPDX-License-Identifier = "GPL-2.0-only"
