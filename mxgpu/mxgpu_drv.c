@@ -23,6 +23,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_shmem.h>
@@ -95,6 +96,8 @@ struct mxgpu_scanout_job {
 	bool started, clearing;
 	u32 clear_row;
 	int error;
+	struct drm_rect damage, copy;
+	bool partial, damage_valid;
 };
 
 struct mxgpu_atomic_state {
@@ -188,7 +191,30 @@ struct mxgpu_device {
 	int cursor_y;
 	int cursor_w;
 	int cursor_h;
+	spinlock_t irq_lock;
+	u32 irq_mask;
+	bool vblank_ready;
+	struct drm_rect last_damage;
+	u32 slots_written;
+	struct mutex cursor_lock;
+	struct work_struct cursor_work;
+	spinlock_t cursor_state_lock;
+	bool hw_cursor, hw_cursor_visible, hw_cursor_dirty, hw_cursor_shown;
+	int hw_cursor_x, hw_cursor_y;
+	u32 hw_cursor_failures;
+	u32 cursor_context;
+	u64 cursor_context_generation, cursor_install_generation, cursor_resource_generation;
+	u8 *cursor_image, *cursor_staging;
 };
+
+#define MXGPU_SCANOUT_CHUNK_ROWS 64u
+#define MXGPU_CURSOR_SIZE 64u
+#define MXGPU_CURSOR_BYTES (MXGPU_CURSOR_SIZE * MXGPU_CURSOR_SIZE * 4u)
+#define MXGPU_CURSOR_RESOURCE 1u
+#define MXGPU_CURSOR_MAX_FAILURES 3u
+#define MXGPU_CURSOR_RING 0x3a0000u
+#define MXGPU_CURSOR_COMPLETION 0x3a0400u
+#define MXGPU_CURSOR_COMMAND 0x3a1000u
 
 #define MXGPU_WAIT_SPINS 20u
 /* Sleep between polls. A cold shader compile can take longer than one pump park. */
@@ -217,6 +243,7 @@ static const struct mxgpu_qring mxgpu_rings[6] = {
 	[0] = {0x200u, 0x220u, 0x230u},
 	[1] = {0x250u, 0x270u, 0x280u},
 	[3] = {0x2a0u, 0x2c0u, 0x2d0u},
+	[4] = {MXGPU_CURSOR_RING, MXGPU_CURSOR_RING + 0x100u, MXGPU_CURSOR_RING + 0x200u},
 };
 
 #define MXGPU_BATCH_QSIZE 64u
@@ -254,20 +281,7 @@ static int mxgpu_batch_drain(struct mxgpu_device *mxdev, ktime_t deadline);
 /* Register file in BAR0. Layout is the host transport ABI. */
 #define MXGPU_REG_BAR 0
 #define MXGPU_FB_BAR 2
-#define MXGPU_APERTURE_BASE 0x380u
-#define MXGPU_AREG_CONTROL 0x20u
-#define MXGPU_AREG_STATUS 0x24u
-#define MXGPU_AREG_POWER_ON_BASE_LOW 0x28u
-#define MXGPU_AREG_POWER_ON_BASE_HIGH 0x2cu
-#define MXGPU_AREG_POWER_ON_STRIDE 0x30u
-#define MXGPU_AREG_POWER_ON_WIDTH 0x34u
-#define MXGPU_AREG_POWER_ON_HEIGHT 0x38u
-#define MXGPU_APERTURE_CONTROL_ARM (1u << 0)
-#define MXGPU_APERTURE_BASE_ALIGNMENT 4096u
-#define MXGPU_APERTURE_CONTROL_REFRESH (1u << 2)
-#define MXGPU_APERTURE_STATUS_SUPPORTED (1u << 0)
-#define MXGPU_APERTURE_STATUS_ARMED (1u << 1)
-#define MXGPU_APERTURE_STATUS_FAULT_MASK (0xffu << 8)
+#define MXGPU_APERTURE_BASE MXGPU_APERTURE_REGISTER_BASE
 
 static const u32 mxgpu_formats[] = {
 	DRM_FORMAT_XRGB8888,
@@ -326,6 +340,8 @@ static int mxgpu_cursor_check(struct drm_plane *plane, struct drm_atomic_state *
 
 static void mxgpu_cursor_update(struct drm_plane *plane, struct drm_atomic_state *state);
 static void mxgpu_cursor_disable(struct drm_plane *plane, struct drm_atomic_state *state);
+static void mxgpu_cursor_request(
+	struct mxgpu_device *mxdev, struct drm_plane_state *cursor, bool image_changed);
 
 static const struct drm_plane_helper_funcs mxgpu_cursor_helper = {
 	.atomic_check = mxgpu_cursor_check,
@@ -790,17 +806,76 @@ static int mxgpu_cursor_slot_paint(
 	return 0;
 }
 
-static int mxgpu_scanout_frame(
-	struct mxgpu_device *mxdev, struct drm_plane_state *primary, struct drm_plane_state *cursor)
+static bool mxgpu_full_geometry(struct mxgpu_device *mxdev, struct drm_plane_state *primary)
+{
+	return primary->fb && !primary->crtc_x && !primary->crtc_y && !primary->src_x &&
+	       !primary->src_y && primary->src_w == mxdev->width << 16 &&
+	       primary->src_h == mxdev->height << 16;
+}
+
+static void mxgpu_rect_union(struct drm_rect *out, const struct drm_rect *add)
+{
+	if (!drm_rect_visible(add))
+		return;
+	if (!drm_rect_visible(out)) {
+		*out = *add;
+		return;
+	}
+	out->x1 = min(out->x1, add->x1);
+	out->y1 = min(out->y1, add->y1);
+	out->x2 = max(out->x2, add->x2);
+	out->y2 = max(out->y2, add->y2);
+}
+
+static bool mxgpu_damage_copy(struct mxgpu_device *mxdev, struct drm_plane_state *primary,
+	const struct drm_rect *damage, struct drm_rect *copy)
+{
+	if (!damage || !READ_ONCE(mxdev->hw_cursor) || mxdev->slots_written < 2 ||
+		!mxgpu_full_geometry(mxdev, primary))
+		return false;
+	*copy = *damage;
+	mxgpu_rect_union(copy, &mxdev->last_damage);
+	return true;
+}
+
+static void mxgpu_damage_published(struct mxgpu_device *mxdev, const struct drm_rect *damage)
+{
+	if (damage)
+		mxdev->last_damage = *damage;
+	else
+		drm_rect_init(&mxdev->last_damage, 0, 0, mxdev->width, mxdev->height);
+	if (mxdev->slots_written < 2)
+		mxdev->slots_written++;
+}
+
+static int mxgpu_scanout_frame(struct mxgpu_device *mxdev, struct drm_plane_state *primary,
+	struct drm_plane_state *cursor, const struct drm_rect *damage)
 {
 	struct mxgpu_cursor_slot *slot = NULL;
 	u32 target = mxdev->scanout_front ^ 1u, device_generation = 0;
+	struct drm_rect copy;
 	int width, height, ret;
 
 	if (mxdev->scanout_stopped)
 		return -ENODEV;
 	if (!primary || !primary->fb)
 		return -EINVAL;
+	if (mxgpu_damage_copy(mxdev, primary, damage, &copy)) {
+		if (!drm_rect_visible(&copy))
+			return 0;
+		mxgpu_scanout_begin(mxdev);
+		ret = mxgpu_blit(mxdev, primary->fb, copy.x1, copy.y1, copy.x1, copy.y1,
+			drm_rect_width(&copy), drm_rect_height(&copy));
+		if (!ret)
+			ret = mxgpu_scanout_publish(mxdev);
+		if (ret)
+			mxdev->slots_written = 0;
+		else
+			mxgpu_damage_published(mxdev, damage);
+		return ret;
+	}
+	if (READ_ONCE(mxdev->hw_cursor))
+		cursor = NULL;
 	if (mxgpu_cursor_cache_geometry(mxdev, primary) && mxdev->regs &&
 		!(readl(mxdev->regs + MXGPU_REG_STATUS) &
 			(MXGPU_STATUS_RESET_REQUIRED | MXGPU_STATUS_TRANSPORT_FAULT))) {
@@ -823,6 +898,10 @@ static int mxgpu_scanout_frame(
 			   : mxgpu_paint_cursor_state(mxdev, primary, cursor, true);
 	if (!ret)
 		ret = mxgpu_scanout_publish(mxdev);
+	if (ret || !READ_ONCE(mxdev->hw_cursor) || !mxgpu_full_geometry(mxdev, primary))
+		mxdev->slots_written = 0;
+	else
+		mxgpu_damage_published(mxdev, damage);
 	if (ret) {
 		mxgpu_cursor_cache_invalidate(mxdev);
 	} else if (slot && readl(mxdev->regs + MXGPU_REG_DEVICE_GENERATION) == device_generation) {
@@ -848,18 +927,19 @@ static int mxgpu_cursor_scanout_frame(
 		mxdev->cursor_primary_x != primary->src_x ||
 		mxdev->cursor_primary_y != primary->src_y) {
 		mxgpu_cursor_cache_invalidate(mxdev);
-		return mxgpu_scanout_frame(mxdev, primary, cursor);
+		return mxgpu_scanout_frame(mxdev, primary, cursor, NULL);
 	}
 	slot = &mxdev->cursor_slots[mxdev->scanout_front ^ 1u];
 	if (!slot->generation || slot->generation != mxdev->cursor_generation)
-		return mxgpu_scanout_frame(mxdev, primary, cursor);
+		return mxgpu_scanout_frame(mxdev, primary, cursor, NULL);
 	if (!mxdev->regs ||
 		slot->device_generation != readl(mxdev->regs + MXGPU_REG_DEVICE_GENERATION) ||
 		(readl(mxdev->regs + MXGPU_REG_STATUS) &
 			(MXGPU_STATUS_RESET_REQUIRED | MXGPU_STATUS_TRANSPORT_FAULT))) {
 		mxgpu_cursor_cache_invalidate(mxdev);
-		return mxgpu_scanout_frame(mxdev, primary, cursor);
+		return mxgpu_scanout_frame(mxdev, primary, cursor, NULL);
 	}
+	mxdev->slots_written = 0;
 	mxgpu_scanout_begin(mxdev);
 	mxgpu_cursor_slot_restore(mxdev, slot);
 	ret = mxgpu_cursor_slot_paint(mxdev, slot, cursor);
@@ -929,9 +1009,22 @@ static void mxgpu_scanout_work(struct work_struct *work)
 		goto out;
 	}
 	if (!job->started) {
+		job->partial = mxgpu_damage_copy(mxdev, state, job->partial ? &job->damage : NULL,
+			&job->copy);
+		if (job->partial && !drm_rect_visible(&job->copy)) {
+			list_del(&job->link);
+			mutex_unlock(&mxdev->scanout_lock);
+			mxgpu_scanout_job_complete(mxdev, job);
+			mxgpu_scanout_job_free(job);
+			mutex_lock(&mxdev->scanout_lock);
+			if (!mxdev->scanout_stopped && !list_empty(&mxdev->scanout_jobs))
+				schedule_delayed_work(&mxdev->scanout_work, 0);
+			drm_dev_exit(idx);
+			goto out;
+		}
 		mxgpu_scanout_begin(mxdev);
 		job->started = true;
-		job->clearing = state->fb &&
+		job->clearing = state->fb && !job->partial &&
 				(state->crtc_x || state->crtc_y ||
 					(state->src_w && (state->src_w >> 16) != mxdev->width) ||
 					(state->src_h && (state->src_h >> 16) != mxdev->height) ||
@@ -945,24 +1038,32 @@ static void mxgpu_scanout_work(struct work_struct *work)
 		width = state->fb->width;
 		height = state->fb->height;
 	}
+	if (job->partial) {
+		width = drm_rect_width(&job->copy);
+		height = drm_rect_height(&job->copy);
+	}
 	if (job->clearing) {
-		u32 count = min_t(u32, 8, mxdev->height - job->clear_row);
+		u32 count = min_t(u32, MXGPU_SCANOUT_CHUNK_ROWS, mxdev->height - job->clear_row);
 		mxgpu_clear_scanout_rows(mxdev, job->clear_row, count);
 		job->clear_row += count;
 		job->clearing = job->clear_row < mxdev->height;
 		finished = false;
 		goto copy_done;
 	}
-	rows = min_t(int, 8, height - job->row);
+	rows = min_t(int, MXGPU_SCANOUT_CHUNK_ROWS, height - job->row);
 	if (state->fb && rows > 0) {
-		job->error = mxgpu_blit(mxdev, state->fb, state->crtc_x, state->crtc_y + job->row,
-			state->src_x >> 16, (state->src_y >> 16) + job->row, width, rows);
+		int x = job->partial ? job->copy.x1 : 0, y = job->partial ? job->copy.y1 : 0;
+
+		job->error = mxgpu_blit(mxdev, state->fb, state->crtc_x + x,
+			state->crtc_y + y + job->row, (state->src_x >> 16) + x,
+			(state->src_y >> 16) + y + job->row, width, rows);
 		if (!job->error)
 			job->row += rows;
 	}
 	finished = job->error || !state->fb || job->row >= height;
 	if (finished && !job->error)
-		job->error = mxgpu_paint_cursor_state(mxdev, &job->primary, &job->cursor, true);
+		job->error = mxgpu_paint_cursor_state(mxdev, &job->primary,
+			READ_ONCE(mxdev->hw_cursor) ? NULL : &job->cursor, true);
 	if (job->error)
 		drm_err_ratelimited(&mxdev->drm, "scanout copy failed: %d\n", job->error);
 copy_done:
@@ -973,10 +1074,16 @@ copy_done:
 	}
 	if (finished && state->fb && !job->error)
 		job->error = mxgpu_scanout_publish(mxdev);
+	if (finished && state->fb) {
+		if (job->error || !READ_ONCE(mxdev->hw_cursor) || !mxgpu_full_geometry(mxdev, state))
+			mxdev->slots_written = 0;
+		else
+			mxgpu_damage_published(mxdev, job->damage_valid ? &job->damage : NULL);
+	}
 	if (finished)
 		list_del(&job->link);
 	if (!mxdev->scanout_stopped && !list_empty(&mxdev->scanout_jobs))
-		schedule_delayed_work(&mxdev->scanout_work, msecs_to_jiffies(1));
+		schedule_delayed_work(&mxdev->scanout_work, 0);
 	mutex_unlock(&mxdev->scanout_lock);
 	if (finished) {
 		mxgpu_scanout_job_complete(mxdev, job);
@@ -1036,6 +1143,22 @@ static void mxgpu_scanout_stop(struct mxgpu_device *mxdev)
 	mutex_unlock(&mxdev->scanout_lock);
 }
 
+static void mxgpu_pipe_event(struct mxgpu_device *mxdev, struct drm_crtc *crtc)
+{
+	struct drm_pending_vblank_event *event = crtc->state->event;
+	unsigned long flags;
+
+	if (!event)
+		return;
+	crtc->state->event = NULL;
+	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+	if (mxdev->vblank_ready && crtc->state->active && !drm_crtc_vblank_get(crtc))
+		drm_crtc_arm_vblank_event(crtc, event);
+	else
+		drm_crtc_send_vblank_event(crtc, event);
+	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+}
+
 static void mxgpu_pipe_update_active(
 	struct drm_simple_display_pipe *pipe, struct drm_plane_state *old_plane_state)
 {
@@ -1049,24 +1172,31 @@ static void mxgpu_pipe_update_active(
 	if (!state)
 		return;
 	if (!mxdev->fb_ram) {
+		if (!mxstate->primary_updated && READ_ONCE(mxdev->hw_cursor)) {
+			mxgpu_pipe_event(mxdev, &pipe->crtc);
+			return;
+		}
 		if (state->fb)
 			mxdev->present_active = false;
 		mxgpu_scanout_enqueue(mxdev, commit);
 		return;
 	}
 	if (!mxstate->primary_updated)
-		return;
+		goto event;
 	mutex_lock(&mxdev->scanout_lock);
 	mxgpu_cursor_cache_invalidate(mxdev);
 	if (!state->fb || !mxstate->scanout) {
 		mutex_unlock(&mxdev->scanout_lock);
-		return;
+		goto event;
 	}
 	state = &mxstate->scanout->primary;
 	mxdev->present_active = false;
-	if (mxgpu_scanout_frame(mxdev, state, &mxstate->scanout->cursor))
+	if (mxgpu_scanout_frame(mxdev, state, &mxstate->scanout->cursor,
+		    mxstate->scanout->partial ? &mxstate->scanout->damage : NULL))
 		drm_err_ratelimited(&mxdev->drm, "scanout publication failed\n");
 	mutex_unlock(&mxdev->scanout_lock);
+event:
+	mxgpu_pipe_event(mxdev, &pipe->crtc);
 }
 
 static void mxgpu_pipe_update(
@@ -1079,20 +1209,63 @@ static void mxgpu_pipe_update(
 	drm_dev_exit(idx);
 }
 
+static void mxgpu_pipe_enable(struct drm_simple_display_pipe *pipe,
+	struct drm_crtc_state *crtc_state, struct drm_plane_state *plane_state)
+{
+	struct mxgpu_device *mxdev = container_of(pipe, struct mxgpu_device, pipe);
+
+	if (mxdev->vblank_ready)
+		drm_crtc_vblank_on(&pipe->crtc);
+}
+
 static void mxgpu_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
 	struct mxgpu_device *mxdev = container_of(pipe, struct mxgpu_device, pipe);
 
+	if (mxdev->vblank_ready)
+		drm_crtc_vblank_off(&pipe->crtc);
 	mutex_lock(&mxdev->scanout_lock);
 	mxgpu_cursor_cache_invalidate(mxdev);
+	mxdev->slots_written = 0;
 	mutex_unlock(&mxdev->scanout_lock);
+	if (mxdev->fb_ram)
+		mxgpu_pipe_event(mxdev, &pipe->crtc);
+}
+
+static void mxgpu_irq_mask_update(struct mxgpu_device *mxdev, u32 set, u32 clear)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mxdev->irq_lock, flags);
+	mxdev->irq_mask = (mxdev->irq_mask & ~clear) | set;
+	if (READ_ONCE(mxdev->irq_registered))
+		writel(mxdev->irq_mask, mxdev->regs + MXGPU_REG_IRQ_MASK);
+	spin_unlock_irqrestore(&mxdev->irq_lock, flags);
+}
+
+static int mxgpu_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
+{
+	struct mxgpu_device *mxdev = container_of(pipe, struct mxgpu_device, pipe);
+
+	mxgpu_irq_mask_update(mxdev, MXGPU_IRQ_VBLANK, 0);
+	return 0;
+}
+
+static void mxgpu_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
+{
+	struct mxgpu_device *mxdev = container_of(pipe, struct mxgpu_device, pipe);
+
+	mxgpu_irq_mask_update(mxdev, 0, MXGPU_IRQ_VBLANK);
 }
 
 static const struct drm_simple_display_pipe_funcs mxgpu_pipe_funcs = {
 	.mode_valid = mxgpu_mode_valid,
 	.prepare_fb = mxgpu_pipe_prepare,
+	.enable = mxgpu_pipe_enable,
 	.disable = mxgpu_pipe_disable,
 	.update = mxgpu_pipe_update,
+	.enable_vblank = mxgpu_pipe_enable_vblank,
+	.disable_vblank = mxgpu_pipe_disable_vblank,
 };
 
 static void mxgpu_cursor_update_active(struct drm_plane *plane, struct drm_atomic_state *state)
@@ -1101,6 +1274,17 @@ static void mxgpu_cursor_update_active(struct drm_plane *plane, struct drm_atomi
 
 	struct mxgpu_atomic_state *mxstate = container_of(state, struct mxgpu_atomic_state, base);
 
+	if (READ_ONCE(mxdev->hw_cursor)) {
+		struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
+		struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
+
+		if (new && mxstate->cursor_updated)
+			mxgpu_cursor_request(mxdev, new,
+				!old || old->fb != new->fb || old->src_x != new->src_x ||
+					old->src_y != new->src_y || old->src_w != new->src_w ||
+					old->src_h != new->src_h || !READ_ONCE(mxdev->hw_cursor_shown));
+		return;
+	}
 	if (!mxdev->fb_ram) {
 		if (READ_ONCE(mxdev->present_active))
 			return;
@@ -1169,7 +1353,7 @@ static int mxgpu_atomic_check(struct drm_device *dev, struct drm_atomic_state *s
 {
 	struct mxgpu_device *mxdev = container_of(dev, struct mxgpu_device, drm);
 	struct mxgpu_atomic_state *mxstate = container_of(state, struct mxgpu_atomic_state, base);
-	struct drm_plane_state *primary, *cursor;
+	struct drm_plane_state *primary, *cursor, *old_primary;
 	struct drm_crtc_state *crtc;
 	struct mxgpu_scanout_job *job;
 	int ret;
@@ -1195,11 +1379,17 @@ static int mxgpu_atomic_check(struct drm_device *dev, struct drm_atomic_state *s
 		return ret;
 	if (crtc->mode_changed || crtc->active_changed)
 		mxstate->primary_updated = true;
-	if (!mxdev->fb_ram)
-		crtc->no_vblank = false;
+	crtc->no_vblank = false;
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job)
 		return -ENOMEM;
+	old_primary = drm_atomic_get_old_plane_state(state, &mxdev->pipe.plane);
+	job->damage_valid = mxstate->primary_updated && !crtc->mode_changed &&
+			    !crtc->active_changed && old_primary && primary->fb;
+	if (job->damage_valid &&
+		!drm_atomic_helper_damage_merged(old_primary, primary, &job->damage))
+		drm_rect_init(&job->damage, 0, 0, 0, 0);
+	job->partial = job->damage_valid;
 	job->primary = *primary;
 	job->cursor = *cursor;
 	if (job->primary.fb)
@@ -1422,18 +1612,21 @@ static irqreturn_t mxgpu_completion_interrupt(int irq, void *data)
 	if (!READ_ONCE(mxdev->irq_registered))
 		return IRQ_NONE;
 	active = readl(mxdev->regs + MXGPU_REG_IRQ_STATUS) &
-		 readl(mxdev->regs + MXGPU_REG_IRQ_MASK) & MXGPU_COMPLETION_IRQ_MASK;
+		 readl(mxdev->regs + MXGPU_REG_IRQ_MASK) &
+		 (MXGPU_COMPLETION_IRQ_MASK | MXGPU_IRQ_VBLANK);
 	if (!active)
 		return IRQ_NONE;
 	writel(active, mxdev->regs + MXGPU_REG_IRQ_STATUS);
-	wake_up_all(&mxdev->completion_wait);
+	if ((active & MXGPU_IRQ_VBLANK) && mxdev->vblank_ready)
+		drm_crtc_handle_vblank(&mxdev->pipe.crtc);
+	if (active & MXGPU_COMPLETION_IRQ_MASK)
+		wake_up_all(&mxdev->completion_wait);
 	return IRQ_HANDLED;
 }
 
 static void mxgpu_completion_irq_enable(struct mxgpu_device *mxdev)
 {
-	if (READ_ONCE(mxdev->irq_registered))
-		writel(MXGPU_COMPLETION_IRQ_MASK, mxdev->regs + MXGPU_REG_IRQ_MASK);
+	mxgpu_irq_mask_update(mxdev, MXGPU_COMPLETION_IRQ_MASK, 0);
 }
 
 static void mxgpu_completion_irq_stop(struct mxgpu_device *mxdev)
@@ -1461,6 +1654,8 @@ static u32 mxgpu_qreg(u32 queue, u32 reg)
 
 static u32 mxgpu_completion_off(u32 queue)
 {
+	if (queue == MXGPU_QUEUE_CURSOR)
+		return MXGPU_CURSOR_COMPLETION;
 	if (queue == 3u)
 		return 0x10000u;
 	if (queue == MXGPU_RENDER_QUEUE)
@@ -1474,12 +1669,14 @@ static u32 mxgpu_completion_len(u32 queue)
 		return MXGPU_RESPONSE_AREA;
 	if (queue == MXGPU_QUEUE_CONTROL)
 		return MXGPU_COMPLETION_SIZE + MXGPU_FORMAT_CAPABILITIES_SIZE;
-	return 32u;
+	return MXGPU_COMPLETION_SIZE;
 }
 
 /* Command bytes sit past the transfer response so queues cannot overwrite each other. */
 static u32 mxgpu_command_off(u32 queue)
 {
+	if (queue == MXGPU_QUEUE_CURSOR)
+		return MXGPU_CURSOR_COMMAND;
 	if (queue == MXGPU_RENDER_QUEUE)
 		return 0x2a0000u;
 	if (queue == 3u)
@@ -1489,7 +1686,7 @@ static u32 mxgpu_command_off(u32 queue)
 
 static void mxgpu_program_queues(struct mxgpu_device *mxdev)
 {
-	static const u32 queues[] = {0u, MXGPU_RENDER_QUEUE, 3u};
+	static const u32 queues[] = {0u, MXGPU_RENDER_QUEUE, 3u, MXGPU_QUEUE_CURSOR};
 	unsigned int i;
 
 	memset(mxdev->queue_tail, 0, sizeof mxdev->queue_tail);
@@ -1499,11 +1696,16 @@ static void mxgpu_program_queues(struct mxgpu_device *mxdev)
 	memset(mxdev->pending_opcode, 0, sizeof mxdev->pending_opcode);
 	memset(mxdev->pending_ownership, 0, sizeof mxdev->pending_ownership);
 	memset(&mxdev->batch, 0, sizeof mxdev->batch);
+	mxdev->hw_cursor = (mxdev->negotiated_caps.features & MXGPU_FEAT_CURSOR) &&
+			   mxdev->negotiated_caps.limits.max_queues > MXGPU_QUEUE_CURSOR &&
+			   mxdev->cursor_image;
 	for (i = 0; i < ARRAY_SIZE(queues); i++) {
 		u32 queue = queues[i];
 		const struct mxgpu_qring *ring;
+		if (queue == MXGPU_QUEUE_CURSOR && !mxdev->hw_cursor)
+			continue;
 		mxdev->queue_size[queue] =
-			queue != MXGPU_QUEUE_CONTROL &&
+			queue != MXGPU_QUEUE_CONTROL && queue != MXGPU_QUEUE_CURSOR &&
 					mxdev->negotiated_caps.limits.max_descriptors_per_queue >=
 						MXGPU_BATCH_QSIZE
 				? MXGPU_BATCH_QSIZE
@@ -1576,7 +1778,7 @@ static int mxgpu_negotiate(struct pci_dev *pdev, struct mxgpu_device *mxdev)
 		MXGPU_FEAT_VIEWPORT_Y_FLIP | MXGPU_FEAT_SAMPLER_OBJECTS |
 		MXGPU_FEAT_EXTENDED_PIXEL_FORMATS | MXGPU_FEAT_DEPTH_STENCIL_TARGET |
 		MXGPU_FEAT_DEPTH24_STENCIL8 | MXGPU_FEAT_FLOAT_BUFFER_FORMATS |
-		MXGPU_FEAT_TEXTURE_ARRAY | MXGPU_FEAT_TEXTURE_COMPARE;
+		MXGPU_FEAT_TEXTURE_ARRAY | MXGPU_FEAT_TEXTURE_COMPARE | MXGPU_FEAT_VBLANK;
 	request.required_features = MXGPU_FEAT_RENDER | MXGPU_FEAT_MULTI_QUEUE;
 	request_bytes = (u8 *)mxdev->dma + MXGPU_OFF_REQUEST;
 	response = (u8 *)mxdev->dma + MXGPU_OFF_RESPONSE;
@@ -1607,8 +1809,11 @@ static int mxgpu_negotiate(struct pci_dev *pdev, struct mxgpu_device *mxdev)
 		return -EPIPE;
 	mxdev->max_command_bytes = min_t(u32, MXGPU_CMD_BYTES, negotiated.limits.max_command_bytes);
 	mxdev->negotiated_caps = negotiated;
+	mutex_lock(&mxdev->cursor_lock);
 	mxgpu_program_queues(mxdev);
+	mxdev->hw_cursor_failures = 0;
 	mxdev->queue_live = true;
+	mutex_unlock(&mxdev->cursor_lock);
 	mxgpu_completion_irq_enable(mxdev);
 	return 0;
 }
@@ -1654,14 +1859,18 @@ static int mxgpu_recover(struct mxgpu_device *mxdev)
 	status = readl(mxdev->regs + MXGPU_REG_STATUS);
 	if (!(status & (MXGPU_STATUS_RESET_REQUIRED | MXGPU_STATUS_TRANSPORT_FAULT)))
 		return 0;
+	mutex_lock(&mxdev->cursor_lock);
 	mxdev->queue_live = false;
 	mutex_lock(&mxdev->scanout_lock);
 	mxgpu_cursor_cache_invalidate(mxdev);
 	mxdev->cursor_cache_resetting = true;
 	mxdev->present_active = false;
+	mxdev->slots_written = 0;
 	mutex_unlock(&mxdev->scanout_lock);
 	writel(MXGPU_CONTROL_RESET, mxdev->regs + MXGPU_REG_CONTROL);
 	WRITE_ONCE(mxdev->transport_generation, mxdev->transport_generation + 1);
+	mxdev->hw_cursor_shown = false;
+	mutex_unlock(&mxdev->cursor_lock);
 	mutex_lock(&mxdev->cleanup_lock);
 	if (!mxdev->cleanup_stopped)
 		schedule_delayed_work(&mxdev->cleanup_work, 0);
@@ -1680,6 +1889,8 @@ static int mxgpu_recover(struct mxgpu_device *mxdev)
 	if (ret)
 		return ret;
 	mxgpu_arm_scanout(to_pci_dev(mxdev->drm.dev), mxdev);
+	if (READ_ONCE(mxdev->hw_cursor))
+		queue_work(system_highpri_wq, &mxdev->cursor_work);
 	return 0;
 }
 
@@ -1832,7 +2043,7 @@ static int mxgpu_queue_post_internal(
 		    &payload, &payload_bytes) ||
 		header.queue != queue)
 		return -EINVAL;
-	if (mxdev->batch.active) {
+	if (queue != MXGPU_QUEUE_CURSOR && mxdev->batch.active) {
 		ktime_t deadline = mxdev->batch.deadline;
 		if (cleanup) {
 			ktime_t slice = ktime_add_ms(ktime_get(), MXGPU_COMPLETE_TIMEOUT_MS);
@@ -1926,6 +2137,256 @@ static int mxgpu_queue_post(
 	struct mxgpu_device *mxdev, u32 queue, const u8 *command, u32 command_bytes)
 {
 	return mxgpu_queue_post_internal(mxdev, queue, command, command_bytes, false);
+}
+
+static int mxgpu_post_kernel(struct mxgpu_device *mxdev, u32 queue, u16 opcode, u32 context,
+	const u8 *payload, u32 payload_bytes)
+{
+	struct mxgpu_command_header header = {
+		.opcode = opcode,
+		.flags = queue == MXGPU_QUEUE_CURSOR ? 0 : MXGPU_CMD_SIGNAL_FENCE,
+		.context_id = context,
+		.queue = queue,
+		.sequence = mxdev->wire_sequence[queue] + 1,
+	};
+	u32 capacity = MXGPU_COMMAND_HEADER_SIZE + payload_bytes, bytes = 0;
+	u8 *command;
+	int ret;
+
+	if (header.flags & MXGPU_CMD_SIGNAL_FENCE)
+		header.fence_value = mxdev->wire_fence[queue] + 1;
+	command = kvmalloc(capacity, GFP_KERNEL);
+	if (!command)
+		return -ENOMEM;
+	ret = mxgpu_command_encode(&header, payload, payload_bytes, mxdev->max_command_bytes, command,
+		      capacity, &bytes)
+		      ? -EINVAL
+		      : mxgpu_queue_post(mxdev, queue, command, bytes);
+	kvfree(command);
+	return ret;
+}
+
+static int mxgpu_cursor_prepare(struct mxgpu_device *mxdev)
+{
+	struct mxgpu_resource_create create = {
+		.resource_id = MXGPU_CURSOR_RESOURCE,
+		.kind = MXGPU_KIND_TEXTURE_2D,
+		.format = MXGPU_FMT_BGRA8_UNORM,
+		.usage = MXGPU_USAGE_CURSOR | MXGPU_USAGE_TRANSFER_SOURCE |
+			 MXGPU_USAGE_TRANSFER_DESTINATION,
+		.width = MXGPU_CURSOR_SIZE,
+		.height = MXGPU_CURSOR_SIZE,
+		.depth = 1,
+		.array_layers = 1,
+		.mip_levels = 1,
+		.sample_count = 1,
+		.byte_size = MXGPU_CURSOR_BYTES,
+	};
+	u8 payload[MXGPU_RESOURCE_CREATE_SIZE];
+	u32 bytes = 0, id;
+	int ret;
+
+	if (mxdev->cursor_resource_generation == mxdev->transport_generation + 1)
+		return 0;
+	if (mxgpu_resource_create_encode(&create, mxdev->negotiated_caps.limits.max_resource_bytes,
+		    payload, sizeof(payload), &bytes))
+		return -EINVAL;
+	if (mxdev->cursor_context && mxdev->cursor_context_generation == mxdev->transport_generation)
+		id = mxdev->cursor_context;
+	else if (mxdev->next_context == U32_MAX)
+		return -ENOSPC;
+	else
+		id = ++mxdev->next_context;
+	if (id != mxdev->cursor_context) {
+		ret = mxgpu_post_kernel(
+			mxdev, MXGPU_QUEUE_CONTROL, MXGPU_OP_CONTEXT_CREATE, id, NULL, 0);
+		if (ret)
+			return ret;
+		mxdev->cursor_context = id;
+		mxdev->cursor_context_generation = mxdev->transport_generation;
+	}
+	ret = mxgpu_post_kernel(
+		mxdev, MXGPU_QUEUE_CONTROL, MXGPU_OP_RESOURCE_CREATE, id, payload, bytes);
+	if (ret)
+		return ret;
+	mxdev->cursor_resource_generation = mxdev->transport_generation + 1;
+	return 0;
+}
+
+static int mxgpu_cursor_upload(struct mxgpu_device *mxdev, const u8 *image)
+{
+	struct mxgpu_transfer transfer = {
+		.resource_id = MXGPU_CURSOR_RESOURCE,
+		.width = MXGPU_CURSOR_SIZE,
+		.height = MXGPU_CURSOR_SIZE,
+		.depth = 1,
+		.row_bytes = MXGPU_CURSOR_SIZE * 4u,
+		.data_bytes = MXGPU_CURSOR_BYTES,
+	};
+	u32 capacity = MXGPU_TRANSFER_REQUEST_SIZE + MXGPU_CURSOR_BYTES, bytes = 0;
+	u8 *payload = kvmalloc(capacity, GFP_KERNEL);
+	int ret;
+
+	if (!payload)
+		return -ENOMEM;
+	ret = mxgpu_transfer_encode(&transfer, image, payload, capacity, &bytes)
+		      ? -EINVAL
+		      : mxgpu_post_kernel(mxdev, MXGPU_QUEUE_TRANSFER, MXGPU_OP_TRANSFER_TO_HOST,
+				mxdev->cursor_context, payload, bytes);
+	kvfree(payload);
+	return ret;
+}
+
+static int mxgpu_cursor_command(struct mxgpu_device *mxdev, u16 flags, int x, int y)
+{
+	struct mxgpu_cursor_update update = {
+		.resource_id = flags ? 0 : MXGPU_CURSOR_RESOURCE,
+		.flags = flags,
+		.x = flags == MXGPU_CURSOR_HIDE ? 0 : x,
+		.y = flags == MXGPU_CURSOR_HIDE ? 0 : y,
+	};
+	u8 payload[MXGPU_CURSOR_UPDATE_SIZE];
+	u32 bytes = 0;
+
+	if (!mxdev->cursor_context || mxdev->cursor_context_generation != mxdev->transport_generation)
+		return -ENODEV;
+	if (mxgpu_cursor_update_encode(&update, payload, sizeof(payload), &bytes))
+		return -EINVAL;
+	return mxgpu_post_kernel(mxdev, MXGPU_QUEUE_CURSOR, MXGPU_OP_CURSOR_UPDATE,
+		mxdev->cursor_context, payload, bytes);
+}
+
+static int mxgpu_cursor_install(struct mxgpu_device *mxdev, int x, int y)
+{
+	int ret;
+
+	mutex_lock(&mxdev->submit_lock);
+	mutex_lock(&mxdev->cursor_lock);
+	ret = mxdev->hw_cursor && mxdev->queue_live ? mxgpu_cursor_prepare(mxdev) : -ENODEV;
+	if (!ret)
+		ret = mxgpu_cursor_upload(mxdev, mxdev->cursor_staging);
+	if (!ret)
+		ret = mxgpu_cursor_command(mxdev, 0, x, y);
+	mxdev->cursor_install_generation = ret ? 0 : mxdev->transport_generation + 1;
+	mutex_unlock(&mxdev->cursor_lock);
+	mutex_unlock(&mxdev->submit_lock);
+	return ret;
+}
+
+static void mxgpu_cursor_failed(struct mxgpu_device *mxdev, int ret)
+{
+	mutex_lock(&mxdev->cursor_lock);
+	mxdev->cursor_install_generation = 0;
+	if (!READ_ONCE(mxdev->present_active) &&
+		++mxdev->hw_cursor_failures >= MXGPU_CURSOR_MAX_FAILURES && mxdev->hw_cursor) {
+		if (mxdev->hw_cursor_shown && !mxgpu_cursor_command(mxdev, MXGPU_CURSOR_HIDE, 0, 0))
+			mxdev->hw_cursor_shown = false;
+		WRITE_ONCE(mxdev->hw_cursor, false);
+		drm_warn(&mxdev->drm, "host cursor unavailable (%d), using software cursor\n", ret);
+	}
+	mutex_unlock(&mxdev->cursor_lock);
+	mutex_lock(&mxdev->scanout_lock);
+	mxdev->slots_written = 0;
+	mutex_unlock(&mxdev->scanout_lock);
+}
+
+static void mxgpu_cursor_work(struct work_struct *work)
+{
+	struct mxgpu_device *mxdev = container_of(work, struct mxgpu_device, cursor_work);
+	bool visible, dirty, installed;
+	int x, y, ret, idx;
+
+	if (!drm_dev_enter(&mxdev->drm, &idx))
+		return;
+	for (;;) {
+		spin_lock(&mxdev->cursor_state_lock);
+		visible = mxdev->hw_cursor_visible;
+		dirty = mxdev->hw_cursor_dirty;
+		x = mxdev->hw_cursor_x;
+		y = mxdev->hw_cursor_y;
+		if (dirty)
+			memcpy(mxdev->cursor_staging, mxdev->cursor_image, MXGPU_CURSOR_BYTES);
+		mxdev->hw_cursor_dirty = false;
+		spin_unlock(&mxdev->cursor_state_lock);
+		if (!READ_ONCE(mxdev->hw_cursor))
+			break;
+		installed = READ_ONCE(mxdev->cursor_install_generation) ==
+			    READ_ONCE(mxdev->transport_generation) + 1;
+		if (!visible && (!mxdev->hw_cursor_shown || !installed)) {
+			mxdev->hw_cursor_shown = false;
+			ret = 0;
+		} else if (!visible) {
+			mutex_lock(&mxdev->cursor_lock);
+			ret = mxgpu_cursor_command(mxdev, MXGPU_CURSOR_HIDE, 0, 0);
+			mutex_unlock(&mxdev->cursor_lock);
+			mxdev->hw_cursor_shown = !!ret;
+		} else if (dirty || !installed || !mxdev->hw_cursor_shown) {
+			ret = mxgpu_cursor_install(mxdev, x, y);
+			mxdev->hw_cursor_shown = !ret;
+		} else {
+			mutex_lock(&mxdev->cursor_lock);
+			ret = mxgpu_cursor_command(mxdev, MXGPU_CURSOR_MOVE_ONLY, x, y);
+			mutex_unlock(&mxdev->cursor_lock);
+		}
+		if (ret) {
+			mxgpu_cursor_failed(mxdev, ret);
+			break;
+		}
+		mxdev->hw_cursor_failures = 0;
+		spin_lock(&mxdev->cursor_state_lock);
+		dirty = mxdev->hw_cursor_dirty || mxdev->hw_cursor_visible != visible ||
+			mxdev->hw_cursor_x != x || mxdev->hw_cursor_y != y;
+		spin_unlock(&mxdev->cursor_state_lock);
+		if (!dirty)
+			break;
+	}
+	drm_dev_exit(idx);
+}
+
+static void mxgpu_cursor_request(
+	struct mxgpu_device *mxdev, struct drm_plane_state *cursor, bool image_changed)
+{
+	struct mxgpu_fbmap map;
+	bool visible = cursor->fb && cursor->crtc && cursor->visible;
+	int src_x, src_y, width, height, row;
+	u8 *image = NULL;
+
+	if (visible && image_changed) {
+		src_x = cursor->src_x >> 16;
+		src_y = cursor->src_y >> 16;
+		width = min_t(int, cursor->src_w >> 16, MXGPU_CURSOR_SIZE);
+		height = min_t(int, cursor->src_h >> 16, MXGPU_CURSOR_SIZE);
+		image = kzalloc(MXGPU_CURSOR_BYTES, GFP_KERNEL);
+		if (!image || mxgpu_fb_map(cursor->fb, &map)) {
+			kfree(image);
+			return;
+		}
+		for (row = 0; row < height && src_y + row < (int)cursor->fb->height; row++) {
+			u8 *dst = image + row * MXGPU_CURSOR_SIZE * 4;
+			int columns = min_t(int, width, (int)cursor->fb->width - src_x), x;
+
+			if (columns <= 0)
+				break;
+			memcpy(dst, map.ptr + (size_t)(src_y + row) * cursor->fb->pitches[0] +
+					    (size_t)src_x * 4,
+				columns * 4);
+			if (cursor->fb->format->format == DRM_FORMAT_XRGB8888)
+				for (x = 0; x < columns; x++)
+					dst[x * 4 + 3] = 0xff;
+		}
+		mxgpu_fb_unmap(&map);
+	}
+	spin_lock(&mxdev->cursor_state_lock);
+	mxdev->hw_cursor_visible = visible;
+	mxdev->hw_cursor_x = cursor->crtc_x;
+	mxdev->hw_cursor_y = cursor->crtc_y;
+	if (image && memcmp(image, mxdev->cursor_image, MXGPU_CURSOR_BYTES)) {
+		memcpy(mxdev->cursor_image, image, MXGPU_CURSOR_BYTES);
+		mxdev->hw_cursor_dirty = true;
+	}
+	spin_unlock(&mxdev->cursor_state_lock);
+	kfree(image);
+	queue_work(system_highpri_wq, &mxdev->cursor_work);
 }
 
 static int mxgpu_copy_response(
@@ -2783,7 +3244,7 @@ static int mxgpu_ioctl_submit_active(struct drm_device *dev, void *data, struct 
 		return -EACCES;
 	}
 	if (header.context_id != context_id || header.queue != queue ||
-		header.fence_value != fence_value) {
+		queue == MXGPU_QUEUE_CURSOR || header.fence_value != fence_value) {
 		kfree(record);
 		return -EINVAL;
 	}
@@ -2828,6 +3289,7 @@ static int mxgpu_ioctl_submit_active(struct drm_device *dev, void *data, struct 
 			mutex_lock(&mxdev->scanout_lock);
 			mxgpu_cursor_cache_invalidate(mxdev);
 			mxdev->cursor_cache_inhibited = true;
+			mxdev->slots_written = 0;
 			mutex_unlock(&mxdev->scanout_lock);
 		}
 		if (reserve_present) {
@@ -3214,6 +3676,8 @@ static int mxgpu_kms_init(struct mxgpu_device *mxdev)
 	drm->mode_config.min_height = 0;
 	drm->mode_config.max_width = 4096;
 	drm->mode_config.max_height = 4096;
+	drm->mode_config.cursor_width = MXGPU_CURSOR_SIZE;
+	drm->mode_config.cursor_height = MXGPU_CURSOR_SIZE;
 	drm->mode_config.funcs = &mxgpu_mode_funcs;
 	ret = drm_connector_init(
 		drm, &mxdev->connector, &mxgpu_connector_funcs, DRM_MODE_CONNECTOR_VIRTUAL);
@@ -3224,6 +3688,7 @@ static int mxgpu_kms_init(struct mxgpu_device *mxdev)
 		ARRAY_SIZE(mxgpu_formats), NULL, &mxdev->connector);
 	if (ret)
 		return ret;
+	drm_plane_enable_fb_damage_clips(&mxdev->pipe.plane);
 	ret = drm_universal_plane_init(drm, &mxdev->cursor, 1, &mxgpu_cursor_funcs, mxgpu_formats,
 		ARRAY_SIZE(mxgpu_formats), NULL, DRM_PLANE_TYPE_CURSOR, "cursor");
 	if (ret)
@@ -3349,6 +3814,14 @@ static int mxgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	INIT_DELAYED_WORK(&mxdev->scanout_work, mxgpu_scanout_work);
 	INIT_LIST_HEAD(&mxdev->scanout_jobs);
 	spin_lock_init(&mxdev->fence_lock);
+	spin_lock_init(&mxdev->irq_lock);
+	spin_lock_init(&mxdev->cursor_state_lock);
+	mutex_init(&mxdev->cursor_lock);
+	INIT_WORK(&mxdev->cursor_work, mxgpu_cursor_work);
+	mxdev->cursor_image = devm_kzalloc(&pdev->dev, MXGPU_CURSOR_BYTES, GFP_KERNEL);
+	mxdev->cursor_staging = devm_kzalloc(&pdev->dev, MXGPU_CURSOR_BYTES, GFP_KERNEL);
+	if (!mxdev->cursor_staging)
+		mxdev->cursor_image = NULL;
 	mxdev->fence_context = dma_fence_context_alloc(1);
 	pci_set_drvdata(pdev, mxdev);
 	ret = pci_enable_device(pdev);
@@ -3419,6 +3892,13 @@ static int mxgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = mxgpu_kms_init(mxdev);
 	if (ret)
 		goto unmap;
+	if ((mxdev->negotiated_caps.features & MXGPU_FEAT_VBLANK) &&
+		READ_ONCE(mxdev->irq_registered)) {
+		ret = drm_vblank_init(&mxdev->drm, 1);
+		if (ret)
+			goto unmap;
+		mxdev->vblank_ready = true;
+	}
 	mxgpu_arm_scanout(pdev, mxdev);
 	ret = drm_dev_register(&mxdev->drm, 0);
 	if (ret)
@@ -3427,6 +3907,7 @@ static int mxgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	drm_client_setup(&mxdev->drm, NULL);
 	return 0;
 unmap:
+	cancel_work_sync(&mxdev->cursor_work);
 	mxgpu_scanout_stop(mxdev);
 	mxgpu_completion_irq_stop(mxdev);
 	mxgpu_quiesce_transport(pdev, mxdev);
@@ -3456,6 +3937,7 @@ disable:
 	mutex_destroy(&mxdev->cleanup_lock);
 	mutex_destroy(&mxdev->scanout_lock);
 	mutex_destroy(&mxdev->submit_lock);
+	mutex_destroy(&mxdev->cursor_lock);
 	pci_disable_device(pdev);
 	return ret;
 }
@@ -3471,10 +3953,12 @@ static void mxgpu_remove(struct pci_dev *pdev)
 	mxgpu_scanout_stop(mxdev);
 	drm_dev_unplug(&mxdev->drm);
 	drm_atomic_helper_shutdown(&mxdev->drm);
+	cancel_work_sync(&mxdev->cursor_work);
 	mxgpu_quiesce_transport(pdev, mxdev);
 	mutex_destroy(&mxdev->cleanup_lock);
 	mutex_destroy(&mxdev->scanout_lock);
 	mutex_destroy(&mxdev->submit_lock);
+	mutex_destroy(&mxdev->cursor_lock);
 	if (mxdev->dma)
 		dma_free_coherent(&pdev->dev, MXGPU_DMA_BYTES, mxdev->dma, mxdev->dma_addr);
 	if (mxdev->fb) {
