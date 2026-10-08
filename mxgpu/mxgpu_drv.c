@@ -215,6 +215,10 @@ struct mxgpu_device {
 #define MXGPU_CURSOR_RING 0x3a0000u
 #define MXGPU_CURSOR_COMPLETION 0x3a0400u
 #define MXGPU_CURSOR_COMMAND 0x3a1000u
+#define MXGPU_CURSOR_COMMAND_BYTES 0x800u
+#define MXGPU_COMPUTE_RING 0x3a1800u
+#define MXGPU_COMPUTE_COMPLETION 0x3a1c00u
+#define MXGPU_COMPUTE_COMMAND 0x3a2000u
 
 #define MXGPU_WAIT_SPINS 20u
 /* Sleep between polls. A cold shader compile can take longer than one pump park. */
@@ -243,6 +247,7 @@ static const struct mxgpu_qring mxgpu_rings[6] = {
 	[0] = {0x200u, 0x220u, 0x230u},
 	[1] = {0x250u, 0x270u, 0x280u},
 	[3] = {0x2a0u, 0x2c0u, 0x2d0u},
+	[2] = {MXGPU_COMPUTE_RING, MXGPU_COMPUTE_RING + 0x100u, MXGPU_COMPUTE_RING + 0x200u},
 	[4] = {MXGPU_CURSOR_RING, MXGPU_CURSOR_RING + 0x100u, MXGPU_CURSOR_RING + 0x200u},
 };
 
@@ -269,6 +274,8 @@ static const struct mxgpu_qring mxgpu_batch_rings[6] = {
 static_assert(
 	MXGPU_BATCH_COMPLETIONS + MXGPU_DRM_BATCH_MAX_COMMANDS * MXGPU_COMPLETION_SIZE <= 0x10000u);
 static_assert(MXGPU_BATCH_ARENA + MXGPU_DRM_BATCH_MAX_COMMAND_BYTES <= MXGPU_DMA_BYTES);
+static_assert(MXGPU_CURSOR_COMMAND + MXGPU_CURSOR_COMMAND_BYTES <= MXGPU_COMPUTE_RING);
+static_assert(MXGPU_COMPUTE_COMMAND < MXGPU_DMA_BYTES);
 
 static const struct mxgpu_qring *mxgpu_ring(struct mxgpu_device *mxdev, u32 queue)
 {
@@ -1656,6 +1663,8 @@ static u32 mxgpu_completion_off(u32 queue)
 {
 	if (queue == MXGPU_QUEUE_CURSOR)
 		return MXGPU_CURSOR_COMPLETION;
+	if (queue == MXGPU_QUEUE_COMPUTE)
+		return MXGPU_COMPUTE_COMPLETION;
 	if (queue == 3u)
 		return 0x10000u;
 	if (queue == MXGPU_RENDER_QUEUE)
@@ -1677,6 +1686,8 @@ static u32 mxgpu_command_off(u32 queue)
 {
 	if (queue == MXGPU_QUEUE_CURSOR)
 		return MXGPU_CURSOR_COMMAND;
+	if (queue == MXGPU_QUEUE_COMPUTE)
+		return MXGPU_COMPUTE_COMMAND;
 	if (queue == MXGPU_RENDER_QUEUE)
 		return 0x2a0000u;
 	if (queue == 3u)
@@ -1684,9 +1695,24 @@ static u32 mxgpu_command_off(u32 queue)
 	return 0x220000u;
 }
 
+static u32 mxgpu_command_cap(u32 queue)
+{
+	if (queue == MXGPU_QUEUE_CURSOR)
+		return MXGPU_CURSOR_COMMAND_BYTES;
+	if (queue == MXGPU_QUEUE_COMPUTE)
+		return MXGPU_DMA_BYTES - MXGPU_COMPUTE_COMMAND;
+	return MXGPU_CMD_BYTES;
+}
+
+static bool mxgpu_compute_ready(struct mxgpu_device *mxdev)
+{
+	return (mxdev->negotiated_caps.features & MXGPU_FEAT_COMPUTE) &&
+	       mxdev->negotiated_caps.limits.max_queues > MXGPU_QUEUE_COMPUTE;
+}
+
 static void mxgpu_program_queues(struct mxgpu_device *mxdev)
 {
-	static const u32 queues[] = {0u, MXGPU_RENDER_QUEUE, 3u, MXGPU_QUEUE_CURSOR};
+	static const u32 queues[] = {0u, MXGPU_RENDER_QUEUE, MXGPU_QUEUE_COMPUTE, 3u, MXGPU_QUEUE_CURSOR};
 	unsigned int i;
 
 	memset(mxdev->queue_tail, 0, sizeof mxdev->queue_tail);
@@ -1702,10 +1728,14 @@ static void mxgpu_program_queues(struct mxgpu_device *mxdev)
 	for (i = 0; i < ARRAY_SIZE(queues); i++) {
 		u32 queue = queues[i];
 		const struct mxgpu_qring *ring;
-		if (queue == MXGPU_QUEUE_CURSOR && !mxdev->hw_cursor)
+		if ((queue == MXGPU_QUEUE_CURSOR && !mxdev->hw_cursor) ||
+			(queue == MXGPU_QUEUE_COMPUTE && !mxgpu_compute_ready(mxdev))) {
+			mxdev->queue_size[queue] = 0;
 			continue;
+		}
 		mxdev->queue_size[queue] =
 			queue != MXGPU_QUEUE_CONTROL && queue != MXGPU_QUEUE_CURSOR &&
+					queue != MXGPU_QUEUE_COMPUTE &&
 					mxdev->negotiated_caps.limits.max_descriptors_per_queue >=
 						MXGPU_BATCH_QSIZE
 				? MXGPU_BATCH_QSIZE
@@ -1778,7 +1808,8 @@ static int mxgpu_negotiate(struct pci_dev *pdev, struct mxgpu_device *mxdev)
 		MXGPU_FEAT_VIEWPORT_Y_FLIP | MXGPU_FEAT_SAMPLER_OBJECTS |
 		MXGPU_FEAT_EXTENDED_PIXEL_FORMATS | MXGPU_FEAT_DEPTH_STENCIL_TARGET |
 		MXGPU_FEAT_DEPTH24_STENCIL8 | MXGPU_FEAT_FLOAT_BUFFER_FORMATS |
-		MXGPU_FEAT_TEXTURE_ARRAY | MXGPU_FEAT_TEXTURE_COMPARE | MXGPU_FEAT_VBLANK;
+		MXGPU_FEAT_TEXTURE_ARRAY | MXGPU_FEAT_TEXTURE_COMPARE | MXGPU_FEAT_VBLANK |
+		MXGPU_FEAT_COMPUTE;
 	request.required_features = MXGPU_FEAT_RENDER | MXGPU_FEAT_MULTI_QUEUE;
 	request_bytes = (u8 *)mxdev->dma + MXGPU_OFF_REQUEST;
 	response = (u8 *)mxdev->dma + MXGPU_OFF_RESPONSE;
@@ -2039,6 +2070,10 @@ static int mxgpu_queue_post_internal(
 	if (mxdev->submit_stopped || !mxdev->queue_live || !command || !command_bytes ||
 		command_bytes > mxdev->max_command_bytes || queue >= MXGPU_QUEUE_COUNT)
 		return -ENODEV;
+	if (!mxdev->queue_size[queue])
+		return -ENODEV;
+	if (command_bytes > mxgpu_command_cap(queue))
+		return -E2BIG;
 	if (mxgpu_command_decode(command, command_bytes, mxdev->max_command_bytes, &header,
 		    &payload, &payload_bytes) ||
 		header.queue != queue)
@@ -2081,7 +2116,7 @@ static int mxgpu_queue_post_internal(
 
 	cmd = (u8 *)mxdev->dma + mxgpu_command_off(queue);
 	if (mxgpu_command_encode(&header, payload, payload_bytes, mxdev->max_command_bytes, cmd,
-		    MXGPU_CMD_BYTES, &len))
+		    mxgpu_command_cap(queue), &len))
 		return -EINVAL;
 	memset((u8 *)mxdev->dma + mxgpu_completion_off(queue), 0, 32);
 	memset(&read_desc, 0, sizeof read_desc);
