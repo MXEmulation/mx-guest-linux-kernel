@@ -1,7 +1,7 @@
 <!-- REUSE-IgnoreStart -->
 # mx-guest-linux-kernel
 
-The `mxgpu` DRM/KMS module for MX virtual GPUs. It implements PCI negotiation, DMA command queues, GEM buffers, atomic primary and cursor planes, aperture scanout, render submissions and optional DRM batches. When the host offers them, the cursor plane uses the host cursor queue, page-flip events follow host vblank interrupts, and aperture updates copy only the damaged region.
+The `mxgpu` DRM/KMS module for MX virtual GPUs. It implements PCI negotiation, DMA command queues, GEM buffers, atomic primary and cursor planes, aperture scanout, render submissions and optional DRM batches. When the host offers them, the cursor plane uses the host cursor queue, page-flip events follow a vblank timer at the mode refresh rate, and aperture updates copy only the damaged region.
 
 The `mxgpu` module has been built and exercised on AArch64 Linux 7.0. Desktop and graphics API validation is ongoing.
 

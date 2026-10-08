@@ -1252,17 +1252,12 @@ static void mxgpu_irq_mask_update(struct mxgpu_device *mxdev, u32 set, u32 clear
 
 static int mxgpu_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
 {
-	struct mxgpu_device *mxdev = container_of(pipe, struct mxgpu_device, pipe);
-
-	mxgpu_irq_mask_update(mxdev, MXGPU_IRQ_VBLANK, 0);
-	return 0;
+	return drm_crtc_vblank_start_timer(&pipe->crtc);
 }
 
 static void mxgpu_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
 {
-	struct mxgpu_device *mxdev = container_of(pipe, struct mxgpu_device, pipe);
-
-	mxgpu_irq_mask_update(mxdev, 0, MXGPU_IRQ_VBLANK);
+	drm_crtc_vblank_cancel_timer(&pipe->crtc);
 }
 
 static const struct drm_simple_display_pipe_funcs mxgpu_pipe_funcs = {
@@ -1619,15 +1614,11 @@ static irqreturn_t mxgpu_completion_interrupt(int irq, void *data)
 	if (!READ_ONCE(mxdev->irq_registered))
 		return IRQ_NONE;
 	active = readl(mxdev->regs + MXGPU_REG_IRQ_STATUS) &
-		 readl(mxdev->regs + MXGPU_REG_IRQ_MASK) &
-		 (MXGPU_COMPLETION_IRQ_MASK | MXGPU_IRQ_VBLANK);
+		 readl(mxdev->regs + MXGPU_REG_IRQ_MASK) & MXGPU_COMPLETION_IRQ_MASK;
 	if (!active)
 		return IRQ_NONE;
 	writel(active, mxdev->regs + MXGPU_REG_IRQ_STATUS);
-	if ((active & MXGPU_IRQ_VBLANK) && mxdev->vblank_ready)
-		drm_crtc_handle_vblank(&mxdev->pipe.crtc);
-	if (active & MXGPU_COMPLETION_IRQ_MASK)
-		wake_up_all(&mxdev->completion_wait);
+	wake_up_all(&mxdev->completion_wait);
 	return IRQ_HANDLED;
 }
 
@@ -1808,8 +1799,7 @@ static int mxgpu_negotiate(struct pci_dev *pdev, struct mxgpu_device *mxdev)
 		MXGPU_FEAT_VIEWPORT_Y_FLIP | MXGPU_FEAT_SAMPLER_OBJECTS |
 		MXGPU_FEAT_EXTENDED_PIXEL_FORMATS | MXGPU_FEAT_DEPTH_STENCIL_TARGET |
 		MXGPU_FEAT_DEPTH24_STENCIL8 | MXGPU_FEAT_FLOAT_BUFFER_FORMATS |
-		MXGPU_FEAT_TEXTURE_ARRAY | MXGPU_FEAT_TEXTURE_COMPARE | MXGPU_FEAT_VBLANK |
-		MXGPU_FEAT_COMPUTE;
+		MXGPU_FEAT_TEXTURE_ARRAY | MXGPU_FEAT_TEXTURE_COMPARE | MXGPU_FEAT_COMPUTE;
 	request.required_features = MXGPU_FEAT_RENDER | MXGPU_FEAT_MULTI_QUEUE;
 	request_bytes = (u8 *)mxdev->dma + MXGPU_OFF_REQUEST;
 	response = (u8 *)mxdev->dma + MXGPU_OFF_RESPONSE;
@@ -3927,13 +3917,10 @@ static int mxgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = mxgpu_kms_init(mxdev);
 	if (ret)
 		goto unmap;
-	if ((mxdev->negotiated_caps.features & MXGPU_FEAT_VBLANK) &&
-		READ_ONCE(mxdev->irq_registered)) {
-		ret = drm_vblank_init(&mxdev->drm, 1);
-		if (ret)
-			goto unmap;
-		mxdev->vblank_ready = true;
-	}
+	ret = drm_vblank_init(&mxdev->drm, 1);
+	if (ret)
+		goto unmap;
+	mxdev->vblank_ready = true;
 	mxgpu_arm_scanout(pdev, mxdev);
 	ret = drm_dev_register(&mxdev->drm, 0);
 	if (ret)
