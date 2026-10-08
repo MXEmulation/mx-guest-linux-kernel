@@ -3,7 +3,9 @@
 
 The `mxgpu` DRM/KMS module for MX virtual GPUs. It implements PCI negotiation, DMA command queues, GEM buffers, atomic primary and cursor planes, aperture scanout, render submissions and optional DRM batches.
 
-The module has been built and exercised on AArch64 Linux 7.0. Desktop and graphics API validation is ongoing. The `mxguest` agent transport module and DKMS package staging are not implemented in this repository.
+The `mxgpu` module has been built and exercised on AArch64 Linux 7.0. Desktop and graphics API validation is ongoing.
+
+The `mxguest` module is the agent transport. It binds the MX guest-agent PCI device (vendor 0x4d58, device 0x4147), negotiates the split-ring transport, and exposes `/dev/mxguest-agent` (mode 0600, one opener at a time). Each `write()` carries exactly one complete guest-to-host frame and each `read()` returns exactly one complete host-to-guest frame; outgoing frames are validated against the Core frame codec before they are posted. MSI-X is used when available, with a shared INTx fallback. After a device failure the next `open()` resets and reinitialises the device. DKMS package staging is not implemented in this repository.
 
 ## Dependencies
 
@@ -21,9 +23,10 @@ A C compiler, Make and headers for the target kernel are required.
 ```sh
 git submodule update --init --recursive
 make -C mxgpu
+make -C mxguest
 ```
 
-The output is `mxgpu/mxgpu.ko`. The default kernel build directory is `/lib/modules/$(uname -r)/build`; set `KDIR` to select another. `CORE_DIR` and `LINUX_COMMON_DIR` can select development checkouts and default to the pinned submodules.
+The outputs are `mxgpu/mxgpu.ko` and `mxguest/mxguest.ko`. The default kernel build directory is `/lib/modules/$(uname -r)/build`; set `KDIR` to select another. `CORE_DIR` and `LINUX_COMMON_DIR` can select development checkouts and default to the pinned submodules; `mxguest` uses only `CORE_DIR`.
 
 Installation and loading are separate from compilation. Check current DRM users and transport shutdown behavior before replacing a running module.
 
