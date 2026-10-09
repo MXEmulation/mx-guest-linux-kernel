@@ -57,6 +57,8 @@
 	DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_GET_BATCH_LIMITS, struct mxgpu_drm_user)
 #define DRM_IOCTL_MXGPU_SUBMIT_BATCH                                                               \
 	DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_SUBMIT_BATCH, struct mxgpu_drm_user)
+#define DRM_IOCTL_MXGPU_GET_COMPUTE_LIMITS                                                         \
+	DRM_IOWR(DRM_COMMAND_BASE + MXGPU_DRM_IOCTL_GET_COMPUTE_LIMITS, struct mxgpu_drm_user)
 
 struct mxgpu_object {
 	struct list_head link;
@@ -1552,6 +1554,67 @@ static int mxgpu_ioctl_get_transfer_limits(
 		min_t(u32, mxdev->negotiated_caps.limits.max_transfer_from_host_bytes,
 			MXGPU_RESPONSE_AREA - MXGPU_COMPLETION_SIZE);
 	ret = mxgpu_drm_get_transfer_limits_response_encode(
+		&limits, response, sizeof(response), &response_len);
+	if (ret)
+		ret = -EPROTO;
+unlock:
+	mutex_unlock(&mxdev->submit_lock);
+	if (!ret) {
+		if (copy_to_user(u64_to_user_ptr(user->pointer), response, response_len))
+			ret = -EFAULT;
+		else
+			user->size = response_len;
+	}
+exit:
+	drm_dev_exit(idx);
+	return ret;
+}
+
+static int mxgpu_ioctl_get_compute_limits(
+	struct drm_device *dev, void *data, struct drm_file *file)
+{
+	struct mxgpu_device *mxdev = container_of(dev, struct mxgpu_device, drm);
+	struct mxgpu_drm_user *user = data;
+	struct mxgpu_drm_compute_limits limits;
+	u8 *record = NULL;
+	u8 request[MXGPU_DRM_HEADER_BYTES];
+	u8 response[MXGPU_DRM_HEADER_BYTES + MXGPU_DRM_COMPUTE_LIMITS_BYTES];
+	u32 record_len = 0, request_len = 0, response_len = 0;
+	int ret, idx;
+
+	(void)file;
+	ret = mxgpu_copy_record(user, &record, &record_len);
+	if (ret)
+		return ret;
+	ret = mxgpu_drm_get_compute_limits_encode(request, sizeof(request), &request_len);
+	if (ret || record_len != request_len || memcmp(record, request, request_len))
+		ret = -EINVAL;
+	kfree(record);
+	user->size = 0;
+	if (ret)
+		return ret;
+	if (user->capacity < sizeof(response))
+		return -ENOSPC;
+	if (!drm_dev_enter(dev, &idx))
+		return -ENODEV;
+	ret = mutex_lock_interruptible(&mxdev->submit_lock);
+	if (ret)
+		goto exit;
+	if (!mxdev->queue_live) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (!(mxdev->negotiated_caps.features & MXGPU_FEAT_COMPUTE) ||
+		mxdev->negotiated_caps.minor < MXGPU_PROTOCOL_COMPUTE_LIMIT_MINOR) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+	memcpy(limits.max_work_group_size,
+		mxdev->negotiated_caps.limits.max_compute_work_group_size,
+		sizeof(limits.max_work_group_size));
+	limits.max_work_group_invocations =
+		mxdev->negotiated_caps.limits.max_compute_work_group_invocations;
+	ret = mxgpu_drm_get_compute_limits_response_encode(
 		&limits, response, sizeof(response), &response_len);
 	if (ret)
 		ret = -EPROTO;
@@ -3662,6 +3725,8 @@ static const struct drm_ioctl_desc mxgpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(MXGPU_GET_CAPS, mxgpu_ioctl_get_caps, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(
 		MXGPU_GET_TRANSFER_LIMITS, mxgpu_ioctl_get_transfer_limits, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(
+		MXGPU_GET_COMPUTE_LIMITS, mxgpu_ioctl_get_compute_limits, DRM_RENDER_ALLOW),
 };
 
 static const struct file_operations mxgpu_fops = {
