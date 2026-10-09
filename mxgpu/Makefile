@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
 
-ifneq ($(KERNELRELEASE),)
+ifneq ($(src),)
 CORE_DIR ?= $(abspath $(src)/../deps/core)
 LINUX_COMMON_DIR ?= $(abspath $(src)/../deps/linux-common)
 obj-m := mxgpu.o

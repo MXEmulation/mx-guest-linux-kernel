@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # SPDX-FileCopyrightText: 2026 Zak Noble-Clarke
 
-ifneq ($(KERNELRELEASE),)
+ifneq ($(src),)
 CORE_DIR ?= $(abspath $(src)/../deps/core)
 obj-m := mxguest.o
 core-sources := $(filter src/%.c,$(shell cat $(CORE_DIR)/sources.list))
