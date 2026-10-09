@@ -226,6 +226,9 @@ static bool mxguest_opcode_allowed(u16 opcode)
 	case MXGA_OP_COMMAND_RESULT:
 	case MXGA_OP_SYSTEM_STATS:
 	case MXGA_OP_INTEGRATION_STATUS:
+	case MXGA_OP_NETWORK_INFO:
+	case MXGA_OP_SHARE_STATUS:
+	case MXGA_OP_FS_REQUEST:
 		return true;
 	default:
 		return false;
