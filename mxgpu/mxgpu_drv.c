@@ -2883,7 +2883,6 @@ static int mxgpu_batch_validate_command(struct mxgpu_device *mxdev,
 	if (header->opcode != MXGPU_OP_RENDER_SUBMIT_EXTENDED ||
 		command->queue != MXGPU_QUEUE_RENDER ||
 		mxgpu_render_extended_decode(payload, bytes, render, bindings, 64) ||
-		render->depth_stencil_target_id || render->depth_stencil_state_id ||
 		render->vertex_layout_id ||
 		mxgpu_render_extended_features(render, mxdev->negotiated_caps.features))
 		return -EINVAL;
@@ -2895,7 +2894,13 @@ static int mxgpu_batch_validate_command(struct mxgpu_device *mxdev,
 						   MXGPU_OP_BLEND_STATE_DESTROY)) ||
 		(render->index_resource_id &&
 			!mxgpu_batch_object_owned(
-				owner, render->index_resource_id, MXGPU_OP_RESOURCE_DESTROY)))
+				owner, render->index_resource_id, MXGPU_OP_RESOURCE_DESTROY)) ||
+		(render->depth_stencil_target_id &&
+			!mxgpu_batch_object_owned(owner, render->depth_stencil_target_id,
+				MXGPU_OP_RESOURCE_DESTROY)) ||
+		(render->depth_stencil_state_id &&
+			!mxgpu_batch_object_owned(owner, render->depth_stencil_state_id,
+				MXGPU_OP_DEPTH_STENCIL_STATE_DESTROY)))
 		return -EACCES;
 	for (i = 0; i < render->color_target_count; i++)
 		if (!mxgpu_batch_object_owned(
